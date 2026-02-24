@@ -4,7 +4,7 @@ CXXFLAGS := -Wall -Wextra -O3 -std=c++17
 LDFLAGS := -pthread
 
 # Target executable name
-TARGET := irq_test.x
+TARGET := Spectrascope.x
 
 # Source files
 SRCS := main.cpp RpiFastIrq.cpp
