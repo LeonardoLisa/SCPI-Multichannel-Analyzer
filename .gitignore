@@ -1,0 +1,20 @@
+# Object files
+*.o
+.*.o
+
+# Executables
+*.x
+irq_test
+
+# Kernel module artifacts
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.*.cmd
+
+# Data and Plot files
+#*.dat
+#*.png
