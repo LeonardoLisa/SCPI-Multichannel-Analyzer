@@ -1,6 +1,6 @@
 /**
  * @file pmode.cpp
- * @version 1.6.0
+ * @version 1.7.0
  * @date 2026-02-26
  * @author Leonardo Lisa
  * @brief SCPI Multichannel Analyzer - SCPI Polling Mode (Multi-Threaded)
@@ -39,6 +39,7 @@
 #include <sys/stat.h>
 #include <limits>
 #include <sys/time.h>
+#include <poll.h>
 #include "RpiFastIrq.hpp"
 
 // --- ANSI COLORS ---
@@ -112,7 +113,7 @@ void print_header() {
  |____/| .__/ \___|\___|\__|_|  \__,_|____/ \___\___/| .__/ \___|
        |_|                                           |_|         
     )" << ANSI_RESET << "\n";
-    std::cout << "v1.6.0 - SCPI Multichannel Analyzer (Polling Mode)\n";
+    std::cout << "v1.7.0 - SCPI Multichannel Analyzer (Polling Mode)\n";
     std::cout << "--------------------------------------------------------\n";
 }
 
@@ -256,7 +257,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (valid_cmds.empty() && !fetch_wave) {
-        std::cerr << ANSI_RED << "[Error] No valid parameters provided. Add at least one measurement or WAVE." << ANSI_RESET << "\n\n";
+        std::cerr << ANSI_RED << "[Error] No valid parameters provided. Add between 1 and 4 SCPI measurements, or use WAVE." << ANSI_RESET << "\n\n";
         print_available_commands();
         return 1;
     }
@@ -271,8 +272,19 @@ int main(int argc, char* argv[]) {
     
     while (g_keep_running) {
         if (scope_ip.empty()) {
-            std::cout << ANSI_CYAN << "[Setup]" << ANSI_RESET << " Enter Oscilloscope IP Address: ";
-            std::cin >> scope_ip;
+            std::cout << ANSI_CYAN << "[Setup]" << ANSI_RESET << " Enter Oscilloscope IP Address: " << std::flush;
+            
+            struct pollfd pfd;
+            pfd.fd = STDIN_FILENO;
+            pfd.events = POLLIN;
+            
+            while (g_keep_running) {
+                if (poll(&pfd, 1, 100) > 0) {
+                    std::cin >> scope_ip;
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                    break;
+                }
+            }
             if (!g_keep_running) break;
         }
 
@@ -320,10 +332,6 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Clear input buffer safely
-    std::cin.clear();
-    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-
     send_cmd(sock, "CHDR OFF");        
     send_cmd(sock, "C1:TRA ON");       
     send_cmd(sock, "TRMD SINGLE");     
@@ -339,12 +347,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << ANSI_CYAN << "[System]" << ANSI_RESET << " Ready. Press ENTER to start acquisition and create log files. ";
+    std::cout << ANSI_CYAN << "[System]" << ANSI_RESET << " Ready. Press ENTER to start acquisition and create log files. " << std::flush;
     
-    // Non-blocking wait loop for ENTER or Ctrl+C
+    struct pollfd pfd_enter;
+    pfd_enter.fd = STDIN_FILENO;
+    pfd_enter.events = POLLIN;
+
     while (g_keep_running) {
-        if (std::cin.peek() != EOF && std::cin.get() == '\n') break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (poll(&pfd_enter, 1, 100) > 0) {
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            break;
+        }
     }
     
     if (!g_keep_running) {
@@ -366,7 +379,7 @@ int main(int argc, char* argv[]) {
         filename = ss.str();
         std::cout << "\n" << ANSI_CYAN << "[INFO]" << ANSI_RESET << " Filename not specified. Auto-generated: " << filename << "\n";
     } else {
-        std::cout << "\n"; // Clean line break before running status
+        std::cout << "\n";
     }
 
     std::string base_filename = filename;
@@ -390,7 +403,6 @@ int main(int argc, char* argv[]) {
         uint64_t w_count = 0;
         AcqData data;
         
-        // Ensure graceful exit without losing data trapped in the write buffer
         while (g_keep_running || !g_write_buffer.is_empty()) {
             if (g_write_buffer.pop(data)) {
                 w_count++;
