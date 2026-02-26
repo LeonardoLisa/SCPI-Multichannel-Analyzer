@@ -7,7 +7,7 @@ LDFLAGS := -pthread
 TARGET := Spectrascope.x
 
 # Source files
-SRCS := pmode.cpp RpiFastIrq.cpp
+SRCS := smode.cpp RpiFastIrq.cpp
 
 # Object files
 OBJS := $(SRCS:.cpp=.o)
