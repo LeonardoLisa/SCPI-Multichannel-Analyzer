@@ -69,9 +69,10 @@ MODULE_VERSION("2.0");
 
 // Shared payload structure
 struct GpioIrqEvent {
-    u64 timestamp_ns;
-    u32 event_counter;
-    // u32 pin_state;
+    uint64_t timestamp_ns;   // u64 in C
+    uint32_t event_counter;  // u32 in C
+    //uint32_t pin_state;     // u32 in C
+    uint32_t _padding;       // Explicit padding to 16 bytes
 };
 
 #define KBUF_SIZE 256
@@ -107,7 +108,7 @@ static irqreturn_t gpio_isr(int irq, void *dev_id) {
     // Write payload
     shared_buf->events[current_head % KBUF_SIZE].timestamp_ns = ts;
     shared_buf->events[current_head % KBUF_SIZE].event_counter = total_interrupts;
-    shared_buf->events[current_head % KBUF_SIZE].pin_state = state;
+    //shared_buf->events[current_head % KBUF_SIZE].pin_state = state;
     
     // Memory barrier: ensure payload is written to memory before head is updated
     smp_store_release(&shared_buf->head, current_head + 1);
@@ -194,7 +195,11 @@ static int __init rpi_fast_irq_init(void) {
 
     if (!gpio_is_valid(GPIO_PIN)) goto r_device;
 
-    gpio_request(GPIO_PIN, "sysfs");
+    if (gpio_request(GPIO_PIN, "sysfs") < 0) {
+    pr_err("[%s] Failed to request GPIO %d\n", DEVICE_NAME, GPIO_PIN);
+    goto r_device;
+    }
+
     gpio_direction_input(GPIO_PIN);
     
     irq_number = gpio_to_irq(GPIO_PIN);
