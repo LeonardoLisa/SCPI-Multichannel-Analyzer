@@ -1,7 +1,7 @@
 /**
  * @file pmode.cpp
- * @version 1.5.0
- * @date 2026-02-25
+ * @version 1.6.0
+ * @date 2026-02-26
  * @author Leonardo Lisa
  * @brief SCPI Multichannel Analyzer - SCPI Polling Mode (Multi-Threaded)
  * @details Fetches hardware triggers via rpi_fast_irq, waits 300ms for DSP
@@ -112,12 +112,12 @@ void print_header() {
  |____/| .__/ \___|\___|\__|_|  \__,_|____/ \___\___/| .__/ \___|
        |_|                                           |_|         
     )" << ANSI_RESET << "\n";
-    std::cout << "v1.5.0 - SCPI Multichannel Analyzer\n";
+    std::cout << "v1.6.0 - SCPI Multichannel Analyzer (Polling Mode)\n";
     std::cout << "--------------------------------------------------------\n";
 }
 
 void print_available_commands() {
-    std::cout << ANSI_CYAN << "\n[Available SCPI Parameters]\n" << ANSI_RESET;
+    std::cout << ANSI_CYAN << "[Available SCPI Parameters]\n" << ANSI_RESET;
     std::cout << "Voltage Measurements:\n";
     std::cout << "  PKPK   : Peak-to-Peak Voltage\n";
     std::cout << "  MAX    : Maximum Voltage\n";
@@ -139,7 +139,10 @@ void print_available_commands() {
     std::cout << "  DUTY   : Positive Duty Cycle\n";
     std::cout << "  NDUTY  : Negative Duty Cycle\n\n";
     std::cout << "Special Flags:\n";
-    std::cout << "  WAVE   : Download full binary waveform data\n";
+    std::cout << "  WAVE   : Download full binary waveform data\n\n";
+    std::cout << ANSI_CYAN << "[Configuration Flags]\n" << ANSI_RESET;
+    std::cout << "  -o <file>  : Specify output filename (e.g., -o data.dat)\n";
+    std::cout << "  -ip <addr> : Specify oscilloscope IP address directly\n";
 }
 
 bool is_valid_scpi_cmd(const std::string& cmd) {
@@ -152,11 +155,13 @@ bool is_valid_scpi_cmd(const std::string& cmd) {
 }
 
 void send_cmd(int sock, const std::string &cmd) {
+    if (!g_keep_running || sock < 0) return;
     std::string packet = cmd + "\n";
-    send(sock, packet.c_str(), packet.length(), 0);
+    send(sock, packet.c_str(), packet.length(), MSG_NOSIGNAL);
 }
 
 std::string read_resp_string(int sock) {
+    if (!g_keep_running || sock < 0) return "";
     char buffer[4096] = {0};
     int valread = read(sock, buffer, 4095);
     if (valread > 0) {
@@ -170,6 +175,7 @@ std::string read_resp_string(int sock) {
 }
 
 std::vector<char> read_waveform_binary(int sock) {
+    if (!g_keep_running || sock < 0) return {};
     send_cmd(sock, "C1:WF? DAT2");
     char c;
     
@@ -223,6 +229,7 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::string> valid_cmds;
     std::string filename = "";
+    std::string scope_ip = "";
     bool fetch_wave = false;
 
     // Parse CLI arguments
@@ -230,6 +237,8 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "-o" && i + 1 < argc) {
             filename = argv[++i];
+        } else if (arg == "-ip" && i + 1 < argc) {
+            scope_ip = argv[++i];
         } else {
             std::transform(arg.begin(), arg.end(), arg.begin(), ::toupper);
             if (arg == "WAVE") {
@@ -238,7 +247,7 @@ int main(int argc, char* argv[]) {
                 if (is_valid_scpi_cmd(arg)) {
                     valid_cmds.push_back(arg);
                 } else {
-                    std::cerr << ANSI_RED << "[Error] Invalid SCPI parameter: " << arg << ANSI_RESET << "\n";
+                    std::cerr << ANSI_RED << "[Error] Invalid SCPI parameter: " << arg << ANSI_RESET << "\n\n";
                     print_available_commands();
                     return 1;
                 }
@@ -247,7 +256,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (valid_cmds.empty() && !fetch_wave) {
-        std::cerr << ANSI_RED << "[Error] No valid parameters provided. Add at least one measurement or WAVE.\n" << ANSI_RESET;
+        std::cerr << ANSI_RED << "[Error] No valid parameters provided. Add at least one measurement or WAVE." << ANSI_RESET << "\n\n";
         print_available_commands();
         return 1;
     }
@@ -259,11 +268,13 @@ int main(int argc, char* argv[]) {
 
     // TCP Socket Setup & Dynamic IP Configuration
     int sock = -1;
-    std::string scope_ip;
     
     while (g_keep_running) {
-        std::cout << ANSI_CYAN << "[Setup]" << ANSI_RESET << " Enter Oscilloscope IP Address: ";
-        std::cin >> scope_ip;
+        if (scope_ip.empty()) {
+            std::cout << ANSI_CYAN << "[Setup]" << ANSI_RESET << " Enter Oscilloscope IP Address: ";
+            std::cin >> scope_ip;
+            if (!g_keep_running) break;
+        }
 
         sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
@@ -286,6 +297,8 @@ int main(int argc, char* argv[]) {
         if (inet_pton(AF_INET, scope_ip.c_str(), &serv_addr.sin_addr) <= 0) {
             std::cerr << ANSI_RED << "[Error] Invalid IP address format. Please try again.\n" << ANSI_RESET;
             close(sock);
+            sock = -1;
+            scope_ip = ""; // Reset IP to force user prompt
             continue;
         }
 
@@ -293,6 +306,8 @@ int main(int argc, char* argv[]) {
         if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
             std::cerr << ANSI_RED << "[Error] Connection failed. Please check the IP and try again.\n" << ANSI_RESET;
             close(sock);
+            sock = -1;
+            scope_ip = ""; // Reset IP to force user prompt
             continue;
         }
 
@@ -305,6 +320,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Clear input buffer safely
+    std::cin.clear();
     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
     send_cmd(sock, "CHDR OFF");        
@@ -322,8 +339,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << ANSI_CYAN << "[System]" << ANSI_RESET << " Ready. Press ENTER to start acquisition and create log files.\n";
-    std::cin.get();
+    std::cout << ANSI_CYAN << "[System]" << ANSI_RESET << " Ready. Press ENTER to start acquisition and create log files. ";
+    
+    // Non-blocking wait loop for ENTER or Ctrl+C
+    while (g_keep_running) {
+        if (std::cin.peek() != EOF && std::cin.get() == '\n') break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     
     if (!g_keep_running) {
         irq_handler.stop();
@@ -342,7 +364,9 @@ int main(int argc, char* argv[]) {
         std::stringstream ss;
         ss << "acquisition_" << std::put_time(std::localtime(&in_time_t), "%H-%M-%S_%d-%m-%Y") << ".dat";
         filename = ss.str();
-        std::cout << ANSI_CYAN << "[INFO]" << ANSI_RESET << " Filename not specified. Auto-generated: " << filename << "\n";
+        std::cout << "\n" << ANSI_CYAN << "[INFO]" << ANSI_RESET << " Filename not specified. Auto-generated: " << filename << "\n";
+    } else {
+        std::cout << "\n"; // Clean line break before running status
     }
 
     std::string base_filename = filename;
@@ -366,6 +390,7 @@ int main(int argc, char* argv[]) {
         uint64_t w_count = 0;
         AcqData data;
         
+        // Ensure graceful exit without losing data trapped in the write buffer
         while (g_keep_running || !g_write_buffer.is_empty()) {
             if (g_write_buffer.pop(data)) {
                 w_count++;
@@ -463,8 +488,10 @@ int main(int argc, char* argv[]) {
     std::cout << ANSI_CYAN << "\n[System]" << ANSI_RESET << " Shutting down. Waiting for background I/O to flush...\n";
     
     irq_handler.stop();
-    send_cmd(sock, "CHDR SHORT");
-    close(sock);
+    if (sock >= 0) {
+        send_cmd(sock, "CHDR SHORT");
+        close(sock);
+    }
     
     if (writer_thread.joinable()) {
         writer_thread.join();
