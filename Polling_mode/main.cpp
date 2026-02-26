@@ -1,12 +1,12 @@
 /**
  * @file main.cpp
- * @version 1.4.0
- * @date 2026-02-24
+ * @version 1.5.0
+ * @date 2026-02-25
  * @author Leonardo Lisa
  * @brief SCPI Multichannel Analyzer - SCPI Polling Mode (Multi-Threaded)
- * @details Fetches hardware triggers via rpi_fast_irq, executes direct SCPI 
- * queries over TCP without status polling, and offloads disk I/O to a background 
- * consumer thread. Validates strict SCPI commands and delays file creation until execution.
+ * @details Fetches hardware triggers via rpi_fast_irq, waits 300ms for DSP
+ * processing, executes SCPI queries over TCP, and offloads disk I/O to a 
+ * background consumer thread. Features realtime UI tracking of valid acquisitions.
  * @requirements rpi_fast_irq kernel module, RpiFastIrq library, isolated CPU 3.
  *
  * This program is free software: you can redistribute it and/or modify
@@ -111,9 +111,9 @@ void print_header() {
   ___) | |_) |  __/ (__| |_| | | (_| |___) | (_| (_) | |_) |  __/
  |____/| .__/ \___|\___|\__|_|  \__,_|____/ \___\___/| .__/ \___|
        |_|                                           |_|         
-    )" << ANSI_RESET << std::endl;
-    std::cout << "v1.4.0 - SCPI Multichannel Analyzer" << std::endl;
-    std::cout << "--------------------------------------------------------" << std::endl;
+    )" << ANSI_RESET << "\n";
+    std::cout << "v1.5.0 - SCPI Multichannel Analyzer\n";
+    std::cout << "--------------------------------------------------------\n";
 }
 
 void print_available_commands() {
@@ -262,7 +262,7 @@ int main(int argc, char* argv[]) {
     std::string scope_ip;
     
     while (g_keep_running) {
-        std::cout << ANSI_CYAN << "[Setup] Enter Oscilloscope IP Address: " << ANSI_RESET;
+        std::cout << ANSI_CYAN << "[Setup]" << ANSI_RESET << " Enter Oscilloscope IP Address: ";
         std::cin >> scope_ip;
 
         sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -284,19 +284,19 @@ int main(int argc, char* argv[]) {
         serv_addr.sin_port = htons(PORT);
         
         if (inet_pton(AF_INET, scope_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-            std::cerr << ANSI_YELLOW << "[Error] Invalid IP address format. Please try again.\n" << ANSI_RESET;
+            std::cerr << ANSI_RED << "[Error] Invalid IP address format. Please try again.\n" << ANSI_RESET;
             close(sock);
             continue;
         }
 
-        std::cout << ANSI_CYAN << "[System] Testing connection to " << scope_ip << "...\n" << ANSI_RESET;
+        std::cout << ANSI_CYAN << "[System]" << ANSI_RESET << " Testing connection to " << scope_ip << "...\n";
         if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
             std::cerr << ANSI_RED << "[Error] Connection failed. Please check the IP and try again.\n" << ANSI_RESET;
             close(sock);
             continue;
         }
 
-        std::cout << ANSI_GREEN << "[Success] Connected to " << scope_ip << ".\n" << ANSI_RESET;
+        std::cout << ANSI_GREEN << "[Success]" << ANSI_RESET << " Connected to " << scope_ip << ".\n";
         break; 
     }
 
@@ -322,7 +322,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << ANSI_CYAN << "[System] Ready. Press ENTER to start acquisition and create log files." << ANSI_RESET;
+    std::cout << ANSI_CYAN << "[System]" << ANSI_RESET << " Ready. Press ENTER to start acquisition and create log files.\n";
     std::cin.get();
     
     if (!g_keep_running) {
@@ -342,7 +342,7 @@ int main(int argc, char* argv[]) {
         std::stringstream ss;
         ss << "acquisition_" << std::put_time(std::localtime(&in_time_t), "%H-%M-%S_%d-%m-%Y") << ".dat";
         filename = ss.str();
-        std::cout << ANSI_CYAN << "[INFO] Filename not specified. Auto-generated: " << filename << "\n" << ANSI_RESET;
+        std::cout << ANSI_CYAN << "[INFO]" << ANSI_RESET << " Filename not specified. Auto-generated: " << filename << "\n";
     }
 
     std::string base_filename = filename;
@@ -387,49 +387,70 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    std::cout << ANSI_YELLOW << "[Running] Press Ctrl+C to stop.\n" << ANSI_RESET;
+    std::cout << ANSI_YELLOW << "[Running]" << ANSI_RESET << " Press Ctrl+C to stop.\n";
     send_cmd(sock, "ARM");
 
-    uint64_t count = 0;
+    uint64_t total_events = 0;
+    std::vector<uint64_t> success_counts(valid_cmds.size(), 0);
+    uint64_t wave_success_count = 0;
     GpioIrqEvent event;
 
-    // Producer Thread: Direct Polling without SAST
+    // Producer Thread: Wait 300ms, then poll DSP status
     while (g_keep_running) {
         if (g_event_buffer.pop(event)) {
             AcqData acq;
             acq.timestamp_ns = event.timestamp_ns;
+            total_events++;
+
+            // Wait empirically determined 300ms for DSP post-processing 
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
             if (!valid_cmds.empty() && g_keep_running) {
-                for (const auto& cmd : valid_cmds) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(300000));
-                    send_cmd(sock, "C1:PAVA? " + cmd);
-                    std::string resp = read_resp_string(sock);
+                for (size_t i = 0; i < valid_cmds.size(); ++i) {
+                    const auto& cmd = valid_cmds[i];
+                    std::string val = "?";
+                    int retries = 0;
+                    const int MAX_RETRIES = 10; // 50ms total polling after 300ms delay
 
-                    // --- DEBUG STAMPA RAW ---
-                    //std::cout << ANSI_CYAN << "\n[DEBUG] Comando: " << cmd << " | Risposta RAW: '" << resp << "'" << ANSI_RESET;
-                    // ------------------------
-
-                    std::string val = extract_value(resp);
-                    acq.meas_results.push_back(val);
-                    if (val == "?") {
-                        std::cerr << ANSI_YELLOW << "\n[Warn] SCPI Measurement read failed for " << cmd << ".\n" << ANSI_RESET;
+                    while (retries < MAX_RETRIES && g_keep_running) {
+                        send_cmd(sock, "C1:PAVA? " + cmd);
+                        std::string resp = read_resp_string(sock);
+                        
+                        if (resp.find("****") == std::string::npos && !resp.empty()) {
+                            val = extract_value(resp);
+                            if (val != "?") {
+                                success_counts[i]++;
+                            }
+                            break; 
+                        }
+                        
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        retries++;
                     }
+                    acq.meas_results.push_back(val);
                 }
             }
 
             if (fetch_wave && g_keep_running) {
                 acq.wave_data = read_waveform_binary(sock);
-                if (acq.wave_data.empty()) {
-                    std::cerr << ANSI_RED << "\n[Warn] SCPI Waveform read failed or empty.\n" << ANSI_RESET;
+                if (!acq.wave_data.empty()) {
+                    wave_success_count++;
                 }
             }
 
             if (!g_write_buffer.push(std::move(acq))) {
-                std::cerr << ANSI_RED << "\n[Warn] Consumer thread overload. Data dropped.\n" << ANSI_RESET;
+                std::cerr << ANSI_YELLOW << "\n[Warn]" << ANSI_RESET << " Consumer thread overload. Data dropped.\n";
             }
             
-            count++;
-            std::cout << ANSI_GREEN << "\r[Running] Acquisitions: " << count << ANSI_RESET << std::flush;
+            // Realtime terminal status line
+            std::cout << "\r" << ANSI_GREEN << "[Acquisition]" << ANSI_RESET << " Events: " << total_events;
+            for (size_t i = 0; i < valid_cmds.size(); ++i) {
+                std::cout << " | " << valid_cmds[i] << ": " << success_counts[i];
+            }
+            if (fetch_wave) {
+                std::cout << " | WAVE: " << wave_success_count;
+            }
+            std::cout << "    " << std::flush;
 
             if (g_keep_running) {
                 send_cmd(sock, "ARM");
@@ -439,7 +460,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cout << ANSI_CYAN << "\n[System] Shutting down. Waiting for background I/O to flush...\n" << ANSI_RESET;
+    std::cout << ANSI_CYAN << "\n[System]" << ANSI_RESET << " Shutting down. Waiting for background I/O to flush...\n";
     
     irq_handler.stop();
     send_cmd(sock, "CHDR SHORT");
