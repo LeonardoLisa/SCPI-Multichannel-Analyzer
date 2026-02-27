@@ -5,7 +5,7 @@
  * @author Leonardo Lisa
  * @brief SCPI Real-Time Histogram Analyzer (Polling Mode) for Siglent SDS800X HD.
  * @details Fetches hardware triggers via rpi_fast_irq, acquires vertical voltage 
- * @execution sudo CXX=g++ -E ./pmode_root.x MIN
+ * @execution sudo CXX=g++ -E ./pmode_root.x MIN -ip "192.168.178.54"
  * measurements via SCPI, and plots an auto-scaling real-time histogram using ROOT.
  * Extent is based on 8*V/div. Max bins bounded to 4096 (12-bit ADC native resolution).
  * @requirements rpi_fast_irq kernel module, RpiFastIrq library, CERN ROOT Framework.
@@ -253,6 +253,8 @@ int main(int argc, char* argv[]) {
     hist->SetFillColor(kBlue - 9);
     hist->SetLineWidth(2);
 
+    hist->Draw();
+
     RpiFastIrq irq_handler("/dev/rp1_gpio_irq");
     if (!irq_handler.start([](const GpioIrqEvent& event) { g_event_buffer.push(event); })) {
         std::cerr << ANSI_RED << "[Error] IRQ listener failed.\n" << ANSI_RESET;
@@ -309,6 +311,8 @@ int main(int argc, char* argv[]) {
                             hist->SetLineWidth(2);
                             
                             for (const auto& d : acquired_data) hist->Fill(d.second);
+                            
+                            hist->Draw();
                         } else {
                             hist->Fill(abs_val);
                         }
