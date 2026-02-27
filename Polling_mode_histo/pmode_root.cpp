@@ -1,6 +1,6 @@
 /**
  * @file pmode_root.cpp
- * @version 1.1.0
+ * @version 1.2.0
  * @date 2026-02-27
  * @author Leonardo Lisa
  * @brief SCPI Real-Time Histogram Analyzer (Polling Mode) for Siglent SDS800X HD.
@@ -75,6 +75,14 @@ public:
         return true;
     }
 
+    bool push(T&& item) {
+        size_t current_head = m_head.load(std::memory_order_relaxed);
+        if (current_head - m_tail.load(std::memory_order_acquire) >= Size) return false;
+        m_data[current_head % Size] = std::move(item);
+        m_head.store(current_head + 1, std::memory_order_release);
+        return true;
+    }
+
     bool pop(T& item) {
         size_t current_tail = m_tail.load(std::memory_order_relaxed);
         if (current_tail == m_head.load(std::memory_order_acquire)) return false;
@@ -137,7 +145,7 @@ bool is_valid_measurement(const std::string& cmd) {
 }
 
 int main(int argc, char* argv[]) {
-    TApplication app("SCPI_HIST_GUI", &argc, argv);
+    // Intercept SIGINT during the setup phase
     std::signal(SIGINT, signal_handler);
 
     std::cout << ANSI_CYAN << "========================================================\n";
@@ -220,6 +228,10 @@ int main(int argc, char* argv[]) {
         if (sock >= 0) close(sock);
         return 0;
     }
+
+    TApplication app("SCPI_HIST_GUI", &argc, argv);
+    
+    std::signal(SIGINT, signal_handler);
 
     send_cmd(sock, "C1:VDIV?");
     std::string vdiv_resp = read_resp_string(sock);
