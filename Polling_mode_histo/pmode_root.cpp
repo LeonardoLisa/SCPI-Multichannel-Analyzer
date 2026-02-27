@@ -1,10 +1,11 @@
 /**
  * @file pmode_root.cpp
- * @version 1.0.0
+ * @version 1.1.0
  * @date 2026-02-27
  * @author Leonardo Lisa
  * @brief SCPI Real-Time Histogram Analyzer (Polling Mode) for Siglent SDS800X HD.
  * @details Fetches hardware triggers via rpi_fast_irq, acquires vertical voltage 
+ * @execution sudo CXX=g++ -E ./pmode_root.x MIN
  * measurements via SCPI, and plots an auto-scaling real-time histogram using ROOT.
  * Extent is based on 8*V/div. Max bins bounded to 4096 (12-bit ADC native resolution).
  * @requirements rpi_fast_irq kernel module, RpiFastIrq library, CERN ROOT Framework.
@@ -13,6 +14,14 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include <iostream>
@@ -41,7 +50,6 @@
 
 #include "RpiFastIrq.hpp"
 
-// --- ANSI COLORS ---
 #define ANSI_RED     "\x1b[31m"
 #define ANSI_GREEN   "\x1b[32m"
 #define ANSI_YELLOW  "\x1b[33m"
@@ -49,7 +57,7 @@
 #define ANSI_RESET   "\x1b[0m"
 
 const int PORT = 5025;
-const int MAX_BINS = 4096; // SDS800X HD 12-bit ADC Native Resolution
+const int MAX_BINS = 4096; 
 
 template <typename T, size_t Size>
 class LockFreeRingBuffer {
@@ -63,14 +71,6 @@ public:
         size_t current_head = m_head.load(std::memory_order_relaxed);
         if (current_head - m_tail.load(std::memory_order_acquire) >= Size) return false;
         m_data[current_head % Size] = item;
-        m_head.store(current_head + 1, std::memory_order_release);
-        return true;
-    }
-
-    bool push(T&& item) {
-        size_t current_head = m_head.load(std::memory_order_relaxed);
-        if (current_head - m_tail.load(std::memory_order_acquire) >= Size) return false;
-        m_data[current_head % Size] = std::move(item);
         m_head.store(current_head + 1, std::memory_order_release);
         return true;
     }
@@ -137,8 +137,8 @@ bool is_valid_measurement(const std::string& cmd) {
 }
 
 int main(int argc, char* argv[]) {
-    std::signal(SIGINT, signal_handler);
     TApplication app("SCPI_HIST_GUI", &argc, argv);
+    std::signal(SIGINT, signal_handler);
 
     std::cout << ANSI_CYAN << "========================================================\n";
     std::cout << " SCPI Real-Time Histogram Analyzer (Vertical Measurements)\n";
@@ -161,7 +161,7 @@ int main(int argc, char* argv[]) {
 
     if (meas_type.empty()) {
         std::cout << ANSI_CYAN << "Available Measurements:\n  PKPK, MAX, MIN, AMPL, TOP, BASE\n" << ANSI_RESET;
-        std::cout << "Enter measurement type: ";
+        std::cout << "Enter measurement type: " << std::flush;
         struct pollfd pfd_m;
         pfd_m.fd = STDIN_FILENO; pfd_m.events = POLLIN;
         while (g_keep_running) {
@@ -171,6 +171,8 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
+        if (!g_keep_running) return 0;
+        
         if (!is_valid_measurement(meas_type)) {
             std::cerr << ANSI_RED << "[Error] Invalid measurement type.\n" << ANSI_RESET;
             return 1;
@@ -180,7 +182,7 @@ int main(int argc, char* argv[]) {
     int sock = -1;
     while (g_keep_running) {
         if (scope_ip.empty()) {
-            std::cout << ANSI_CYAN << "[Setup]" << ANSI_RESET << " Enter Oscilloscope IP Address: ";
+            std::cout << ANSI_CYAN << "[Setup]" << ANSI_RESET << " Enter Oscilloscope IP Address: " << std::flush;
             struct pollfd pfd_ip;
             pfd_ip.fd = STDIN_FILENO; pfd_ip.events = POLLIN;
             while (g_keep_running) {
@@ -190,6 +192,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             if (!g_keep_running) break;
+            std::cout << "\n";
         }
 
         sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -218,7 +221,6 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Query V/div to determine X-axis limits
     send_cmd(sock, "C1:VDIV?");
     std::string vdiv_resp = read_resp_string(sock);
     double vdiv = 1.0; 
@@ -229,7 +231,6 @@ int main(int argc, char* argv[]) {
     }
     double max_x = 8.0 * vdiv;
 
-    // ROOT GUI Initialization
     gStyle->SetOptStat(111111);
     auto canvas = new TCanvas("c_hist", Form("%s Real-Time Monitor", meas_type.c_str()), 900, 600);
     canvas->SetGrid();
@@ -240,7 +241,6 @@ int main(int argc, char* argv[]) {
     hist->SetFillColor(kBlue - 9);
     hist->SetLineWidth(2);
 
-    // Initialize HW Trigger
     RpiFastIrq irq_handler("/dev/rp1_gpio_irq");
     if (!irq_handler.start([](const GpioIrqEvent& event) { g_event_buffer.push(event); })) {
         std::cerr << ANSI_RED << "[Error] IRQ listener failed.\n" << ANSI_RESET;
@@ -248,7 +248,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Configure Oscilloscope
     send_cmd(sock, "CHDR OFF");        
     send_cmd(sock, "C1:TRA ON");       
     send_cmd(sock, "TRMD SINGLE");
@@ -259,12 +258,10 @@ int main(int argc, char* argv[]) {
     std::vector<std::pair<uint64_t, double>> acquired_data;
     GpioIrqEvent event;
 
-    // Main Polling and GUI Loop
     while (g_keep_running) {
-        gSystem->ProcessEvents(); // Non-blocking ROOT GUI update
+        gSystem->ProcessEvents(); 
 
         if (g_event_buffer.pop(event)) {
-            // Non-blocking wait for DSP processing
             auto wait_start = std::chrono::steady_clock::now();
             while (std::chrono::steady_clock::now() - wait_start < std::chrono::milliseconds(300)) {
                 gSystem->ProcessEvents();
@@ -283,7 +280,6 @@ int main(int argc, char* argv[]) {
                         double abs_val = std::abs(std::stod(val_str));
                         acquired_data.push_back({event.timestamp_ns, abs_val});
                         
-                        // Dynamic Bin Rescaling Logic
                         int min_bin_count = -1;
                         for (int i = 1; i <= hist->GetNbinsX(); i++) {
                             int c = hist->GetBinContent(i);
@@ -300,7 +296,6 @@ int main(int argc, char* argv[]) {
                             hist->SetFillColor(kBlue - 9);
                             hist->SetLineWidth(2);
                             
-                            // Refill history into new high-res bins
                             for (const auto& d : acquired_data) hist->Fill(d.second);
                         } else {
                             hist->Fill(abs_val);
@@ -329,22 +324,23 @@ int main(int argc, char* argv[]) {
         close(sock);
     }
 
-    // Export Data & Image
-    auto now = std::chrono::system_clock::now();
-    auto in_time_t = std::chrono::system_clock::to_time_t(now);
-    std::stringstream ss;
-    ss << meas_type << "_" << std::put_time(std::localtime(&in_time_t), "%d-%m-%Y_%H-%M-%S");
-    std::string base_filename = ss.str();
+    if (!acquired_data.empty()) {
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << meas_type << "_" << std::put_time(std::localtime(&in_time_t), "%d-%m-%Y_%H-%M-%S");
+        std::string base_filename = ss.str();
 
-    canvas->SaveAs((base_filename + ".png").c_str());
+        canvas->SaveAs((base_filename + ".png").c_str());
 
-    std::ofstream outfile(base_filename + ".dat");
-    if (outfile.is_open()) {
-        outfile << "# timestamp " << meas_type << "\n";
-        for (const auto& d : acquired_data) {
-            outfile << d.first << " " << d.second << "\n";
+        std::ofstream outfile(base_filename + ".dat");
+        if (outfile.is_open()) {
+            outfile << "# timestamp " << meas_type << "\n";
+            for (const auto& d : acquired_data) {
+                outfile << d.first << " " << d.second << "\n";
+            }
+            outfile.close();
         }
-        outfile.close();
     }
 
     return 0;
