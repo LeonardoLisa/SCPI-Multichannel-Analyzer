@@ -1,12 +1,12 @@
 /**
  * @file pmode_root.cpp
- * @version 1.3.0
+ * @version 2.0.0
  * @date 2026-02-27
  * @author Leonardo Lisa
- * @brief SCPI Real-Time Histogram Analyzer (Polling Mode) for Siglent SDS800X HD.
- * @details Fetches hardware triggers via rpi_fast_irq, acquires vertical voltage 
- * @execution sudo CXX=g++ -E ./pmode_root.x MIN -ip "192.168.178.54"
- * measurements via SCPI, and plots an auto-scaling real-time histogram using ROOT.
+ * @brief SCPI Real-Time Histogram Analyzer (Multithreaded Architecture) for Siglent SDS800X HD.
+ * @details Fetches hardware triggers via rpi_fast_irq. Offloads the 300ms DSP wait and SCPI 
+ * TCP querying to a background thread to prevent X11 display server freezing. Utilizes 
+ * ROOT::EnableThreadSafety() and std::mutex for atomic histogram GUI updates at ~20 FPS.
  * Extent is based on 8*V/div. Max bins bounded to 4096 (12-bit ADC native resolution).
  * @requirements rpi_fast_irq kernel module, RpiFastIrq library, CERN ROOT Framework.
  *
@@ -41,7 +41,9 @@
 #include <iomanip>
 #include <sys/stat.h>
 #include <poll.h>
+#include <mutex>
 
+#include <TROOT.h>
 #include <TApplication.h>
 #include <TCanvas.h>
 #include <TH1D.h>
@@ -71,14 +73,6 @@ public:
         size_t current_head = m_head.load(std::memory_order_relaxed);
         if (current_head - m_tail.load(std::memory_order_acquire) >= Size) return false;
         m_data[current_head % Size] = item;
-        m_head.store(current_head + 1, std::memory_order_release);
-        return true;
-    }
-
-    bool push(T&& item) {
-        size_t current_head = m_head.load(std::memory_order_relaxed);
-        if (current_head - m_tail.load(std::memory_order_acquire) >= Size) return false;
-        m_data[current_head % Size] = std::move(item);
         m_head.store(current_head + 1, std::memory_order_release);
         return true;
     }
@@ -145,7 +139,8 @@ bool is_valid_measurement(const std::string& cmd) {
 }
 
 int main(int argc, char* argv[]) {
-    // 1. Inizializzazione ROOT immediata (come cps_root.cpp)
+    // 1. Thread safety and early GUI initialization
+    ROOT::EnableThreadSafety();
     TApplication app("SCPI_HIST_GUI", &argc, argv);
     std::signal(SIGINT, signal_handler);
 
@@ -196,7 +191,7 @@ int main(int argc, char* argv[]) {
             struct pollfd pfd_ip;
             pfd_ip.fd = STDIN_FILENO; pfd_ip.events = POLLIN;
             while (g_keep_running) {
-                gSystem->ProcessEvents(); // Mantiene X11 reattivo
+                gSystem->ProcessEvents(); 
                 if (poll(&pfd_ip, 1, 100) > 0) {
                     std::cin >> scope_ip;
                     break;
@@ -242,7 +237,6 @@ int main(int argc, char* argv[]) {
     }
     double max_x = 8.0 * vdiv;
 
-    // 2. Setup Canvas
     gStyle->SetOptStat(111111);
     auto canvas = new TCanvas("c_hist", Form("%s Real-Time Monitor", meas_type.c_str()), 900, 600);
     canvas->SetGrid();
@@ -252,12 +246,9 @@ int main(int argc, char* argv[]) {
     hist->SetLineColor(kBlue + 1);
     hist->SetFillColor(kBlue - 9);
     hist->SetLineWidth(2);
-    
-    // Aggancio iniziale obbligatorio
     hist->Draw();
     canvas->Update();
 
-    // 3. Avvio hardware
     RpiFastIrq irq_handler("/dev/rp1_gpio_irq");
     if (!irq_handler.start([](const GpioIrqEvent& event) { g_event_buffer.push(event); })) {
         std::cerr << ANSI_RED << "[Error] IRQ listener failed.\n" << ANSI_RESET;
@@ -273,74 +264,79 @@ int main(int argc, char* argv[]) {
     std::cout << ANSI_YELLOW << "[Running]" << ANSI_RESET << " Waiting for triggers... Press Ctrl+C to stop and save.\n";
 
     std::vector<std::pair<uint64_t, double>> acquired_data;
-    GpioIrqEvent event;
+    std::mutex hist_mutex; // Synchronization lock for ROOT objects
 
-    // 4. Main Loop
+    // 2. Background Thread for SCPI I/O (Blocking operations)
+    std::thread scpi_thread([&]() {
+        GpioIrqEvent event;
+        while (g_keep_running.load(std::memory_order_acquire)) {
+            if (g_event_buffer.pop(event)) {
+                auto wait_start = std::chrono::steady_clock::now();
+                while (std::chrono::steady_clock::now() - wait_start < std::chrono::milliseconds(300)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    if (!g_keep_running.load(std::memory_order_acquire)) break;
+                }
+                if (!g_keep_running.load(std::memory_order_acquire)) break;
+
+                send_cmd(sock, "C1:PAVA? " + meas_type);
+                std::string resp = read_resp_string(sock);
+                
+                if (resp.find("****") == std::string::npos && !resp.empty()) {
+                    std::string val_str = extract_value(resp);
+                    if (val_str != "?") {
+                        try {
+                            double abs_val = std::abs(std::stod(val_str));
+                            acquired_data.push_back({event.timestamp_ns, abs_val});
+                            
+                            std::lock_guard<std::mutex> lock(hist_mutex); // Lock GUI context
+                            
+                            int min_bin_count = -1;
+                            for (int i = 1; i <= hist->GetNbinsX(); i++) {
+                                int c = hist->GetBinContent(i);
+                                if (c > 0) {
+                                    if (min_bin_count == -1 || c < min_bin_count) min_bin_count = c;
+                                }
+                            }
+
+                            // Dynamic bin resizing in-place to avoid Cling JIT recompilation
+                            if (min_bin_count > 10 && current_bins < MAX_BINS) {
+                                current_bins = std::min(current_bins * 2, MAX_BINS);
+                                hist->Reset();
+                                hist->SetBins(current_bins, 0, max_x);
+                                for (const auto& d : acquired_data) hist->Fill(d.second);
+                            } else {
+                                hist->Fill(abs_val);
+                            }
+
+                            std::cout << "\r" << ANSI_GREEN << "[Acquisition]" << ANSI_RESET 
+                                      << " Total Events: " << acquired_data.size() 
+                                      << " | Current Bins: " << current_bins << "    " << std::flush;
+                        } catch (...) {}
+                    }
+                }
+                if (g_keep_running.load(std::memory_order_acquire)) send_cmd(sock, "ARM");
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+    });
+
+    // 3. Main GUI loop (Non-Blocking execution at 20 FPS)
     while (g_keep_running.load(std::memory_order_acquire)) {
         gSystem->ProcessEvents(); 
-
-        if (g_event_buffer.pop(event)) {
-            auto wait_start = std::chrono::steady_clock::now();
-            while (std::chrono::steady_clock::now() - wait_start < std::chrono::milliseconds(300)) {
-                gSystem->ProcessEvents();
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                if (!g_keep_running.load(std::memory_order_acquire)) break;
-            }
-            if (!g_keep_running.load(std::memory_order_acquire)) break;
-
-            send_cmd(sock, "C1:PAVA? " + meas_type);
-            std::string resp = read_resp_string(sock);
-            
-            if (resp.find("****") == std::string::npos && !resp.empty()) {
-                std::string val_str = extract_value(resp);
-                if (val_str != "?") {
-                    try {
-                        double abs_val = std::abs(std::stod(val_str));
-                        acquired_data.push_back({event.timestamp_ns, abs_val});
-                        
-                        int min_bin_count = -1;
-                        for (int i = 1; i <= hist->GetNbinsX(); i++) {
-                            int c = hist->GetBinContent(i);
-                            if (c > 0) {
-                                if (min_bin_count == -1 || c < min_bin_count) min_bin_count = c;
-                            }
-                        }
-
-                        if (min_bin_count > 10 && current_bins < MAX_BINS) {
-                            current_bins = std::min(current_bins * 2, MAX_BINS);
-                            
-                            // FIX STRUTTURALE: Pulizia del canvas prima del delete
-                            canvas->cd();
-                            canvas->Clear(); 
-                            delete hist;
-                            
-                            hist = new TH1D("h_meas", meas_type.c_str(), current_bins, 0, max_x);
-                            hist->SetLineColor(kBlue + 1);
-                            hist->SetFillColor(kBlue - 9);
-                            hist->SetLineWidth(2);
-                            
-                            for (const auto& d : acquired_data) hist->Fill(d.second);
-                            hist->Draw();
-                        } else {
-                            hist->Fill(abs_val);
-                        }
-
-                        canvas->Modified();
-                        canvas->Update();
-                        
-                        std::cout << "\r" << ANSI_GREEN << "[Acquisition]" << ANSI_RESET 
-                                  << " Total Events: " << acquired_data.size() 
-                                  << " | Current Bins: " << current_bins << "    " << std::flush;
-                    } catch (...) {}
-                }
-            }
-            if (g_keep_running.load(std::memory_order_acquire)) send_cmd(sock, "ARM");
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        {
+            std::lock_guard<std::mutex> lock(hist_mutex);
+            canvas->Modified();
+            canvas->Update();
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     std::cout << ANSI_CYAN << "\n[System]" << ANSI_RESET << " Shutting down and exporting data...\n";
+    
+    if (scpi_thread.joinable()) {
+        scpi_thread.join();
+    }
     
     irq_handler.stop();
     if (sock >= 0) {
