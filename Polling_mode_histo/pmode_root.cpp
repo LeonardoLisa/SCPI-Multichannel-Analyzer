@@ -1,6 +1,6 @@
 /**
  * @file pmode_root.cpp
- * @version 1.2.0
+ * @version 1.3.0
  * @date 2026-02-27
  * @author Leonardo Lisa
  * @brief SCPI Real-Time Histogram Analyzer (Polling Mode) for Siglent SDS800X HD.
@@ -101,7 +101,7 @@ LockFreeRingBuffer<GpioIrqEvent, 1024> g_event_buffer;
 
 void signal_handler(int signum) {
     (void)signum;
-    g_keep_running = false;
+    g_keep_running.store(false, std::memory_order_release);
 }
 
 void send_cmd(int sock, const std::string &cmd) {
@@ -145,7 +145,8 @@ bool is_valid_measurement(const std::string& cmd) {
 }
 
 int main(int argc, char* argv[]) {
-    // Intercept SIGINT during the setup phase
+    // 1. Inizializzazione ROOT immediata (come cps_root.cpp)
+    TApplication app("SCPI_HIST_GUI", &argc, argv);
     std::signal(SIGINT, signal_handler);
 
     std::cout << ANSI_CYAN << "========================================================\n";
@@ -173,6 +174,7 @@ int main(int argc, char* argv[]) {
         struct pollfd pfd_m;
         pfd_m.fd = STDIN_FILENO; pfd_m.events = POLLIN;
         while (g_keep_running) {
+            gSystem->ProcessEvents();
             if (poll(&pfd_m, 1, 100) > 0) {
                 std::cin >> meas_type;
                 std::transform(meas_type.begin(), meas_type.end(), meas_type.begin(), ::toupper);
@@ -194,6 +196,7 @@ int main(int argc, char* argv[]) {
             struct pollfd pfd_ip;
             pfd_ip.fd = STDIN_FILENO; pfd_ip.events = POLLIN;
             while (g_keep_running) {
+                gSystem->ProcessEvents(); // Mantiene X11 reattivo
                 if (poll(&pfd_ip, 1, 100) > 0) {
                     std::cin >> scope_ip;
                     break;
@@ -229,10 +232,6 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    TApplication app("SCPI_HIST_GUI", &argc, argv);
-    
-    std::signal(SIGINT, signal_handler);
-
     send_cmd(sock, "C1:VDIV?");
     std::string vdiv_resp = read_resp_string(sock);
     double vdiv = 1.0; 
@@ -243,6 +242,7 @@ int main(int argc, char* argv[]) {
     }
     double max_x = 8.0 * vdiv;
 
+    // 2. Setup Canvas
     gStyle->SetOptStat(111111);
     auto canvas = new TCanvas("c_hist", Form("%s Real-Time Monitor", meas_type.c_str()), 900, 600);
     canvas->SetGrid();
@@ -252,9 +252,12 @@ int main(int argc, char* argv[]) {
     hist->SetLineColor(kBlue + 1);
     hist->SetFillColor(kBlue - 9);
     hist->SetLineWidth(2);
-
+    
+    // Aggancio iniziale obbligatorio
     hist->Draw();
+    canvas->Update();
 
+    // 3. Avvio hardware
     RpiFastIrq irq_handler("/dev/rp1_gpio_irq");
     if (!irq_handler.start([](const GpioIrqEvent& event) { g_event_buffer.push(event); })) {
         std::cerr << ANSI_RED << "[Error] IRQ listener failed.\n" << ANSI_RESET;
@@ -272,7 +275,8 @@ int main(int argc, char* argv[]) {
     std::vector<std::pair<uint64_t, double>> acquired_data;
     GpioIrqEvent event;
 
-    while (g_keep_running) {
+    // 4. Main Loop
+    while (g_keep_running.load(std::memory_order_acquire)) {
         gSystem->ProcessEvents(); 
 
         if (g_event_buffer.pop(event)) {
@@ -280,9 +284,9 @@ int main(int argc, char* argv[]) {
             while (std::chrono::steady_clock::now() - wait_start < std::chrono::milliseconds(300)) {
                 gSystem->ProcessEvents();
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                if (!g_keep_running) break;
+                if (!g_keep_running.load(std::memory_order_acquire)) break;
             }
-            if (!g_keep_running) break;
+            if (!g_keep_running.load(std::memory_order_acquire)) break;
 
             send_cmd(sock, "C1:PAVA? " + meas_type);
             std::string resp = read_resp_string(sock);
@@ -304,14 +308,18 @@ int main(int argc, char* argv[]) {
 
                         if (min_bin_count > 10 && current_bins < MAX_BINS) {
                             current_bins = std::min(current_bins * 2, MAX_BINS);
+                            
+                            // FIX STRUTTURALE: Pulizia del canvas prima del delete
+                            canvas->cd();
+                            canvas->Clear(); 
                             delete hist;
+                            
                             hist = new TH1D("h_meas", meas_type.c_str(), current_bins, 0, max_x);
                             hist->SetLineColor(kBlue + 1);
                             hist->SetFillColor(kBlue - 9);
                             hist->SetLineWidth(2);
                             
                             for (const auto& d : acquired_data) hist->Fill(d.second);
-                            
                             hist->Draw();
                         } else {
                             hist->Fill(abs_val);
@@ -322,11 +330,11 @@ int main(int argc, char* argv[]) {
                         
                         std::cout << "\r" << ANSI_GREEN << "[Acquisition]" << ANSI_RESET 
                                   << " Total Events: " << acquired_data.size() 
-                                  << " | Current Bins: " << current_bins << std::flush;
+                                  << " | Current Bins: " << current_bins << "    " << std::flush;
                     } catch (...) {}
                 }
             }
-            if (g_keep_running) send_cmd(sock, "ARM");
+            if (g_keep_running.load(std::memory_order_acquire)) send_cmd(sock, "ARM");
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
