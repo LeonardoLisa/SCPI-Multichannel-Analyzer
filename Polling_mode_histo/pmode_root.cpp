@@ -51,6 +51,43 @@
 const int PORT = 5025;
 const int MAX_BINS = 4096; // SDS800X HD 12-bit ADC Native Resolution
 
+template <typename T, size_t Size>
+class LockFreeRingBuffer {
+private:
+    T m_data[Size];
+    std::atomic<size_t> m_head{0};
+    std::atomic<size_t> m_tail{0};
+
+public:
+    bool push(const T& item) {
+        size_t current_head = m_head.load(std::memory_order_relaxed);
+        if (current_head - m_tail.load(std::memory_order_acquire) >= Size) return false;
+        m_data[current_head % Size] = item;
+        m_head.store(current_head + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool push(T&& item) {
+        size_t current_head = m_head.load(std::memory_order_relaxed);
+        if (current_head - m_tail.load(std::memory_order_acquire) >= Size) return false;
+        m_data[current_head % Size] = std::move(item);
+        m_head.store(current_head + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T& item) {
+        size_t current_tail = m_tail.load(std::memory_order_relaxed);
+        if (current_tail == m_head.load(std::memory_order_acquire)) return false;
+        item = std::move(m_data[current_tail % Size]);
+        m_tail.store(current_tail + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool is_empty() const {
+        return m_head.load(std::memory_order_acquire) == m_tail.load(std::memory_order_acquire);
+    }
+};
+
 std::atomic<bool> g_keep_running{true};
 LockFreeRingBuffer<GpioIrqEvent, 1024> g_event_buffer;
 
