@@ -1,14 +1,30 @@
 /**
  * @file pmode_root.cpp
- * @version 2.0.0
- * @date 2026-02-27
+ * @version 2.3.0
+ * @date 2026-03-03
  * @author Leonardo Lisa
  * @brief SCPI Real-Time Histogram Analyzer (Multithreaded Architecture) for Siglent SDS800X HD.
  * @details Fetches hardware triggers via rpi_fast_irq. Offloads the 300ms DSP wait and SCPI 
  * TCP querying to a background thread to prevent X11 display server freezing. Utilizes 
- * ROOT::EnableThreadSafety() and std::mutex for atomic histogram GUI updates at ~20 FPS.
- * Extent is based on 8*V/div. Max bins bounded to 4096 (12-bit ADC native resolution).
+ * ROOT::EnableThreadSafety() and std::mutex for atomic histogram GUI updates.
+ * Canvas rendering is throttled to a maximum of 1 Hz to reduce X11 overhead.
+ * Supports manual bounds (-min, -max) and optional fixed binning (-bin).
  * @requirements rpi_fast_irq kernel module, RpiFastIrq library, CERN ROOT Framework.
+ *
+ * @usage sudo ./pmode_root.x [MEASUREMENT] [-ip <address>] [-min <value>] [-max <value>] [-bin <value>]
+ * * Parameters:
+ * MEASUREMENT  : Target vertical measurement. Valid options: PKPK, MAX, MIN, AMPL, TOP, BASE.
+ * -ip <addr>   : (Optional) IPv4 address of the Siglent oscilloscope.
+ * -min <val>   : (Optional) Minimum boundary for the histogram X-axis (e.g., 0.0). Must be >= 0.
+ * -max <val>   : (Optional) Maximum boundary for the histogram X-axis (e.g., 5.0). Must be > min.
+ * -bin <val>   : (Optional) Fixed number of bins for the histogram [5 to 4096]. 
+ * If omitted, dynamic bin resizing is applied automatically.
+ * * Interactive Mode:
+ * If any required parameter (MEASUREMENT, -min, -max, or -ip) is omitted from the CLI, 
+ * the program will prompt the user to input them interactively via standard input.
+ * * Examples:
+ * sudo ./pmode_root.x MIN -ip 192.168.1.100 -min 0.0 -max 3.3 -bin 500
+ * sudo ./pmode_root.x PKPK -min 0.0 -max 5.0
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -42,6 +58,7 @@
 #include <sys/stat.h>
 #include <poll.h>
 #include <mutex>
+#include <cmath>
 
 #include <TROOT.h>
 #include <TApplication.h>
@@ -138,6 +155,20 @@ bool is_valid_measurement(const std::string& cmd) {
     return std::find(valid_cmds.begin(), valid_cmds.end(), cmd) != valid_cmds.end();
 }
 
+void print_usage() {
+    std::cout << ANSI_CYAN << "Usage: " << ANSI_RESET << "./pmode_root.x [MEASUREMENT] [-ip <address>] [-min <value>] [-max <value>] [-bin <value>]\n\n"
+              << "Parameters:\n"
+              << "  MEASUREMENT  : Target vertical measurement (PKPK, MAX, MIN, AMPL, TOP, BASE)\n"
+              << "  -ip <addr>   : IPv4 address of the Siglent oscilloscope\n"
+              << "  -min <val>   : Minimum boundary for the histogram X-axis (Must be >= 0)\n"
+              << "  -max <val>   : Maximum boundary for the histogram X-axis (Must be > min)\n"
+              << "  -bin <val>   : Fixed number of bins for the histogram [5 to 4096]\n"
+              << "  -h, --help   : Display this help message\n\n"
+              << "Examples:\n"
+              << "  ./pmode_root.x MIN -ip 192.168.1.100 -min 0.0 -max 3.3 -bin 500\n"
+              << "  ./pmode_root.x PKPK -min 0.0 -max 5.0\n";
+}
+
 int main(int argc, char* argv[]) {
     // 1. Thread safety and early GUI initialization
     ROOT::EnableThreadSafety();
@@ -150,15 +181,44 @@ int main(int argc, char* argv[]) {
 
     std::string meas_type;
     std::string scope_ip;
+    
+    bool has_min = false, has_max = false;
+    double min_x = 0.0, max_x = 0.0;
+    int current_bins = 10;
+    bool fixed_bins = false;
 
+    // Parse CLI arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-ip" && i + 1 < argc) {
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        } else if (arg == "-ip" && i + 1 < argc) {
             scope_ip = argv[++i];
+        } else if (arg == "-min" && i + 1 < argc) {
+            try { min_x = std::stod(argv[++i]); has_min = true; } 
+            catch (...) { std::cerr << ANSI_RED << "[Error] Invalid -min value.\n" << ANSI_RESET; return 1; }
+        } else if (arg == "-max" && i + 1 < argc) {
+            try { max_x = std::stod(argv[++i]); has_max = true; } 
+            catch (...) { std::cerr << ANSI_RED << "[Error] Invalid -max value.\n" << ANSI_RESET; return 1; }
+        } else if (arg == "-bin" && i + 1 < argc) {
+            try { 
+                current_bins = std::stoi(argv[++i]); 
+                fixed_bins = true;
+                if (current_bins < 5 || current_bins > 4096) {
+                    std::cerr << ANSI_RED << "[Error] -bin parameter must be between 5 and 4096.\n" << ANSI_RESET;
+                    return 1;
+                }
+            } 
+            catch (...) { std::cerr << ANSI_RED << "[Error] Invalid -bin value.\n" << ANSI_RESET; return 1; }
         } else {
             std::transform(arg.begin(), arg.end(), arg.begin(), ::toupper);
             if (is_valid_measurement(arg)) {
                 meas_type = arg;
+            } else {
+                std::cerr << ANSI_RED << "[Error] Unknown parameter or missing value: " << arg << "\n\n" << ANSI_RESET;
+                print_usage();
+                return 1;
             }
         }
     }
@@ -184,6 +244,32 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (!has_min || !has_max) {
+        std::cout << ANSI_CYAN << "[Setup]" << ANSI_RESET << " Enter Histogram Min and Max values (e.g., 0.0 5.0): " << std::flush;
+        struct pollfd pfd_bounds;
+        pfd_bounds.fd = STDIN_FILENO; pfd_bounds.events = POLLIN;
+        while (g_keep_running) {
+            gSystem->ProcessEvents();
+            if (poll(&pfd_bounds, 1, 100) > 0) {
+                std::string line;
+                std::cin >> min_x >> max_x;
+                if (std::cin.fail()) {
+                    std::cerr << ANSI_RED << "\n[Error] Invalid numerical input.\n" << ANSI_RESET;
+                    return 1;
+                }
+                has_min = true;
+                has_max = true;
+                break;
+            }
+        }
+        if (!g_keep_running) return 0;
+    }
+
+    if (min_x < 0 || min_x >= max_x) {
+        std::cerr << ANSI_RED << "[Error] Min value must be >= 0 and strictly less than Max value.\n" << ANSI_RESET;
+        return 1;
+    }
+
     int sock = -1;
     while (g_keep_running) {
         if (scope_ip.empty()) {
@@ -198,7 +284,6 @@ int main(int argc, char* argv[]) {
                 }
             }
             if (!g_keep_running) break;
-            std::cout << "\n";
         }
 
         sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -227,22 +312,11 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    send_cmd(sock, "C1:VDIV?");
-    std::string vdiv_resp = read_resp_string(sock);
-    double vdiv = 1.0; 
-    try {
-        vdiv = std::stod(extract_value(vdiv_resp));
-    } catch (...) {
-        std::cerr << ANSI_YELLOW << "[Warn] Failed to parse V/div. Defaulting to 1.0V\n" << ANSI_RESET;
-    }
-    double max_x = 8.0 * vdiv;
-
-    gStyle->SetOptStat(111111);
+    gStyle->SetOptStat(1111);
     auto canvas = new TCanvas("c_hist", Form("%s Real-Time Monitor", meas_type.c_str()), 900, 600);
     canvas->SetGrid();
 
-    int current_bins = 10;
-    auto hist = new TH1D("h_meas", meas_type.c_str(), current_bins, 0, max_x);
+    auto hist = new TH1D("h_meas", meas_type.c_str(), current_bins, min_x, max_x);
     hist->SetLineColor(kBlue + 1);
     hist->SetFillColor(kBlue - 9);
     hist->SetLineWidth(2);
@@ -264,9 +338,10 @@ int main(int argc, char* argv[]) {
     std::cout << ANSI_YELLOW << "[Running]" << ANSI_RESET << " Waiting for triggers... Press Ctrl+C to stop and save.\n";
 
     std::vector<std::pair<uint64_t, double>> acquired_data;
-    std::mutex hist_mutex; // Synchronization lock for ROOT objects
+    std::vector<double> g_gui_buffer;
+    std::mutex hist_mutex; 
 
-    // 2. Background Thread for SCPI I/O (Blocking operations)
+    // 2. Background Thread for SCPI I/O
     std::thread scpi_thread([&]() {
         GpioIrqEvent event;
         while (g_keep_running.load(std::memory_order_acquire)) {
@@ -285,32 +360,13 @@ int main(int argc, char* argv[]) {
                     std::string val_str = extract_value(resp);
                     if (val_str != "?") {
                         try {
-                            double abs_val = std::abs(std::stod(val_str));
-                            acquired_data.push_back({event.timestamp_ns, abs_val});
+                            double raw_val = std::abs(std::stod(val_str));
                             
-                            std::lock_guard<std::mutex> lock(hist_mutex); // Lock GUI context
-                            
-                            int min_bin_count = -1;
-                            for (int i = 1; i <= hist->GetNbinsX(); i++) {
-                                int c = hist->GetBinContent(i);
-                                if (c > 0) {
-                                    if (min_bin_count == -1 || c < min_bin_count) min_bin_count = c;
-                                }
+                            {
+                                std::lock_guard<std::mutex> lock(hist_mutex); 
+                                acquired_data.push_back({event.timestamp_ns, raw_val});
+                                g_gui_buffer.push_back(raw_val);
                             }
-
-                            // Dynamic bin resizing in-place to avoid Cling JIT recompilation
-                            if (min_bin_count > 10 && current_bins < MAX_BINS) {
-                                current_bins = std::min(current_bins * 2, MAX_BINS);
-                                hist->Reset();
-                                hist->SetBins(current_bins, 0, max_x);
-                                for (const auto& d : acquired_data) hist->Fill(d.second);
-                            } else {
-                                hist->Fill(abs_val);
-                            }
-
-                            std::cout << "\r" << ANSI_GREEN << "[Acquisition]" << ANSI_RESET 
-                                      << " Total Events: " << acquired_data.size() 
-                                      << " | Current Bins: " << current_bins << "    " << std::flush;
                         } catch (...) {}
                     }
                 }
@@ -321,14 +377,57 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // 3. Main GUI loop (Non-Blocking execution at 20 FPS)
+    // 3. Main GUI loop (Non-Blocking execution at 20 FPS, rendering limited to 1 Hz)
+    auto last_update_time = std::chrono::steady_clock::now();
+    bool pending_gui_update = false;
+
     while (g_keep_running.load(std::memory_order_acquire)) {
         gSystem->ProcessEvents(); 
+        
         {
-            std::lock_guard<std::mutex> lock(hist_mutex);
+            std::lock_guard<std::mutex> lock(hist_mutex); 
+            if (!g_gui_buffer.empty()) {
+                for (double val : g_gui_buffer) {
+                    
+                    if (!fixed_bins) {
+                        int min_bin_count = -1;
+                        for (int i = 1; i <= hist->GetNbinsX(); i++) {
+                            int c = hist->GetBinContent(i);
+                            if (c > 0) {
+                                if (min_bin_count == -1 || c < min_bin_count) min_bin_count = c;
+                            }
+                        }
+
+                        if (min_bin_count > 10 && current_bins < MAX_BINS) {
+                            current_bins = std::min(current_bins * 2, MAX_BINS);
+                            hist->Reset();
+                            hist->SetBins(current_bins, min_x, max_x);
+                            for (const auto& d : acquired_data) hist->Fill(d.second);
+                            continue;
+                        }
+                    }
+                    
+                    hist->Fill(val);
+                }
+                
+                g_gui_buffer.clear();
+                pending_gui_update = true;
+
+                std::cout << "\r" << ANSI_GREEN << "[Acquisition]" << ANSI_RESET 
+                          << " Total Events: " << acquired_data.size() 
+                          << " | Current Bins: " << current_bins << "    " << std::flush;
+            }
+        }
+
+        // 1 Hz Rendering Throttle
+        auto now = std::chrono::steady_clock::now();
+        if (pending_gui_update && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update_time).count() >= 1000) {
             canvas->Modified();
             canvas->Update();
+            last_update_time = now;
+            pending_gui_update = false;
         }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
