@@ -1,12 +1,13 @@
 /**
  * @file smode.cpp
- * @version 1.7.0
- * @date 2026-03-03
+ * @version 1.9.0
+ * @date 2026-03-04
  * @author Leonardo Lisa
  * @brief SCPI Sequence Mode Analyzer for Siglent Oscilloscopes.
  * @details Configures sequence mode via ACQ:SEQ, captures waveforms up to 90% capacity 
  * or timeout, extracts data via HISTORy mode, and outputs relative timestamps.
  * Download completes even if interrupted via Ctrl+C. A second Ctrl+C aborts download.
+ * Features a dynamic hard real-time CLI interface.
  * @requirements rpi_fast_irq kernel module, RpiFastIrq library.
  *
  * @usage sudo ./smode.x [MEASUREMENT] [-ip <address>] [-t <timeout_s>]
@@ -26,7 +27,7 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see [https://www.gnu.org/licenses/](https://www.gnu.org/licenses/).
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include <iostream>
@@ -89,6 +90,7 @@ LockFreeRingBuffer<GpioIrqEvent, 8192> g_event_buffer;
 
 void signal_handler(int signum) {
     (void)signum;
+    // If Ctrl+C is pressed a second time, abort the download forcibly
     if (!g_keep_running.load(std::memory_order_acquire)) {
         g_abort_download.store(true, std::memory_order_release);
     }
@@ -284,12 +286,10 @@ int main(int argc, char* argv[]) {
 
         int target_waveforms = max_waveforms * 0.9;
         
-        std::cout << ANSI_CYAN << "[Sequence]" << ANSI_RESET 
-                  << " Arming. Target: " << target_waveforms << " waveforms. Timeout: " << timeout_s << "s\n";
-
         send_cmd(sock, "TRMD SINGLE");
         send_cmd(sock, "ARM");
 
+        // Flush stale IRQs
         GpioIrqEvent dummy;
         while(g_event_buffer.pop(dummy));
 
@@ -297,7 +297,9 @@ int main(int argc, char* argv[]) {
         timestamps.reserve(target_waveforms);
 
         auto start_wait = std::chrono::steady_clock::now();
+        int last_elapsed = -1;
         
+        // Hard real-time polling loop
         while (g_keep_running.load(std::memory_order_acquire)) {
             GpioIrqEvent ev;
             if (g_event_buffer.pop(ev)) {
@@ -309,10 +311,19 @@ int main(int argc, char* argv[]) {
             auto current_time = std::chrono::steady_clock::now();
             int elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - start_wait).count();
 
+            // Dynamic UI update: Triggered every 1 second or when complete
+            if (elapsed != last_elapsed || timestamps.size() >= (size_t)target_waveforms) {
+                std::cout << "\r" << ANSI_CYAN << "[Acquiring]" << ANSI_RESET 
+                          << " Arming. Target: " << timestamps.size() << "/" << target_waveforms 
+                          << " waveforms. Timeout: " << elapsed << "/" << timeout_s << "s    " << std::flush;
+                last_elapsed = elapsed;
+            }
+
             if (timestamps.size() >= (size_t)target_waveforms || elapsed >= timeout_s) {
                 break;
             }
         }
+        std::cout << "\n"; // Move to next line for download UI
 
         send_cmd(sock, "STOP");
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -321,7 +332,7 @@ int main(int argc, char* argv[]) {
         send_cmd(sock, "HISTORy ON");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        std::cout << ANSI_GREEN << "[Download]" << ANSI_RESET 
+        std::cout << ANSI_CYAN << "[Download]" << ANSI_RESET 
                   << " Hardware Interrupts: " << timestamps.size() 
                   << ". Entering History mode and scanning frames...\n";
 
@@ -329,22 +340,21 @@ int main(int argc, char* argv[]) {
 
         for (int i = 1; i <= (int)timestamps.size() && !g_abort_download.load(std::memory_order_acquire); i++) {
             
-            // Richiede all'oscilloscopio di puntare al frame i-esimo
+            // Point to the i-th memory frame
             send_cmd(sock, "HISTOR:FRAM " + std::to_string(i));
             
-            // Interroga l'oscilloscopio per confermare su quale frame si trova realmente
+            // Query scope to confirm the actual frame pointer position
             send_cmd(sock, "HISTOR:FRAM?");
             std::string check_resp = read_resp_string(sock);
             int actual_frame = 0;
             try { actual_frame = std::stoi(extract_value(check_resp)); } catch (...) {}
 
-            // Se l'hardware ha forzato un frame inferiore a quello richiesto,
-            // significa che abbiamo raggiunto e superato il limite di memoria.
+            // If scope forces a lower frame index, end of valid memory is reached
             if (actual_frame < i) {
                 break;
             }
 
-            // Procedi con la misurazione sul frame confermato
+            // Extract the measurement value
             send_cmd(sock, "C1:PAVA? " + meas_type);
             
             std::string val_str = extract_value(read_resp_string(sock));
@@ -364,22 +374,23 @@ int main(int argc, char* argv[]) {
                 } catch (...) {}
             }
             
-            // Aggiornamento progressivo della UI (ogni 10 frame per ridurre I/O a terminale)
+            // Temporary frame progress indicator
             if (valid_frames % 10 == 0 || valid_frames == 1) {
                 std::cout << "\r  Downloading frame " << valid_frames << "    " << std::flush;
             }
         }
         
+        // Finalize download UI element
         if (valid_frames > 0) {
-            std::cout << "\r  Completed download of " << valid_frames << " frames.        \n";
+            std::cout << "\r" << ANSI_GREEN << "[Success]" << ANSI_RESET << " Downloaded " << valid_frames << " frames.        \n";
             outfile.flush();
         } else {
-            std::cout << "  No valid frames found for download.\n";
+            std::cout << "\r" << ANSI_RED << "[Error]" << ANSI_RESET << " No valid frames found for download.        \n";
         }
         
         // Disable History mode
         send_cmd(sock, "HISTORy OFF");
-        send_cmd(sock, "SEQ OFF");
+        send_cmd(sock, "ACQ:SEQ OFF");
     }
 
     std::cout << ANSI_CYAN << "\n[System]" << ANSI_RESET << " Shutting down. Total events saved: " << total_saved_events << "\n";
