@@ -16,5 +16,5 @@ irq_test
 .*.cmd
 
 # Data and Plot files
-#*.dat
-#*.png
+*.dat
+*.png
