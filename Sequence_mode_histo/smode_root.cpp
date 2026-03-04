@@ -11,7 +11,9 @@
  * Supports manual bounds (-min, -max) and optional fixed binning (-bin).
  * @requirements rpi_fast_irq kernel module, RpiFastIrq library, CERN ROOT Framework.
  *
- * @usage ./smode_root.x [MEASUREMENT] [-ip <address>] [-t <update_s>] [-min <value>] [-max <value>] [-bin <value>]
+ * @usage 
+ * sudo chmod 666 /dev/rp1_gpio_irq
+ * ./smode_root.x [MEASUREMENT] [-ip <address>] [-t <update_s>] [-min <value>] [-max <value>] [-bin <value>]
  * * Parameters:
  * MEASUREMENT  : Target vertical measurement. Valid options: PKPK, MAX, MIN, AMPL, TOP, BASE.
  * -ip <addr>   : (Optional) IPv4 address of the Siglent oscilloscope.
