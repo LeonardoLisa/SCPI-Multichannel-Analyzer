@@ -1,6 +1,6 @@
 /**
  * @file smode.cpp
- * @version 1.2.0
+ * @version 1.7.0
  * @date 2026-03-03
  * @author Leonardo Lisa
  * @brief SCPI Sequence Mode Analyzer for Siglent Oscilloscopes.
@@ -26,7 +26,7 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * along with this program.  If not, see [https://www.gnu.org/licenses/](https://www.gnu.org/licenses/).
  */
 
 #include <iostream>
@@ -89,7 +89,6 @@ LockFreeRingBuffer<GpioIrqEvent, 8192> g_event_buffer;
 
 void signal_handler(int signum) {
     (void)signum;
-    // Se premuto Ctrl+C la seconda volta, forza l'abbandono del download
     if (!g_keep_running.load(std::memory_order_acquire)) {
         g_abort_download.store(true, std::memory_order_release);
     }
@@ -273,17 +272,15 @@ int main(int argc, char* argv[]) {
     std::cout << ANSI_YELLOW << "[Running]" << ANSI_RESET << " Sequence Mode initialized. Press Ctrl+C to stop.\n";
 
     while (g_keep_running.load(std::memory_order_acquire)) {
-        // Request sequence mode and set maximum segments
         send_cmd(sock, "ACQ:SEQ ON"); 
         send_cmd(sock, "ACQ:SEQ:COUN 80000"); 
         
-        // Read back the actual maximum waveforms supported by current memory depth configuration
         send_cmd(sock, "ACQ:SEQ:COUN?");
         std::string seq_resp = read_resp_string(sock);
         
         int max_waveforms = 0;
         try { max_waveforms = std::stoi(extract_value(seq_resp)); } 
-        catch (...) { max_waveforms = 1000; } // Fallback safe value
+        catch (...) { max_waveforms = 1000; }
 
         int target_waveforms = max_waveforms * 0.9;
         
@@ -293,7 +290,6 @@ int main(int argc, char* argv[]) {
         send_cmd(sock, "TRMD SINGLE");
         send_cmd(sock, "ARM");
 
-        // Flush stale IRQs before beginning sequence
         GpioIrqEvent dummy;
         while(g_event_buffer.pop(dummy));
 
@@ -302,7 +298,6 @@ int main(int argc, char* argv[]) {
 
         auto start_wait = std::chrono::steady_clock::now();
         
-        // Polling loop for hardware IRQs
         while (g_keep_running.load(std::memory_order_acquire)) {
             GpioIrqEvent ev;
             if (g_event_buffer.pop(ev)) {
@@ -319,61 +314,72 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // SCPI Stop to force sequence acquisition stop and DSP flush
         send_cmd(sock, "STOP");
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-        // Get actual number of acquisitions from the scope
-        send_cmd(sock, "ACQ:NUMAC?");
-        std::string numac_resp = read_resp_string(sock);
-        int captured_frames = 0;
-        try { captured_frames = std::stoi(extract_value(numac_resp)); } catch (...) {}
-
-        int frames_to_read = std::min((int)timestamps.size(), captured_frames);
-        if (captured_frames <= 0) frames_to_read = timestamps.size(); // Fallback
-
-        std::cout << ANSI_GREEN << "[Download]" << ANSI_RESET 
-                  << " Hardware Interrupts: " << timestamps.size() 
-                  << " | Scope Frames: " << captured_frames << ". Entering History mode...\n";
-
-        // Enable History Mode to access internal segments
+        // Enable History Mode
         send_cmd(sock, "HISTORy ON");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        if (frames_to_read > 0) {
-            for (int i = 1; i <= frames_to_read && !g_abort_download.load(std::memory_order_acquire); i++) {
-                
-                // Address the specific memory segment and request measurement
-                send_cmd(sock, "HISTORy:FRAMe " + std::to_string(i));
-                send_cmd(sock, "C1:PAVA? " + meas_type);
-                
-                std::string val_str = extract_value(read_resp_string(sock));
-                if (val_str != "?") {
-                    try {
-                        double val = std::abs(std::stod(val_str));
-                        
-                        if (!has_t0) {
-                            global_t0 = timestamps[0]; // Set absolute time 0
-                            has_t0 = true;
-                        }
+        std::cout << ANSI_GREEN << "[Download]" << ANSI_RESET 
+                  << " Hardware Interrupts: " << timestamps.size() 
+                  << ". Entering History mode and scanning frames...\n";
 
-                        double t_rel_s = (timestamps[i-1] - global_t0) / 1e9;
-                        outfile << std::fixed << std::setprecision(6) << t_rel_s << " " << val << "\n";
-                        total_saved_events++;
-                    } catch (...) {}
-                }
-                
-                if (i % 100 == 0 || i == frames_to_read) {
-                    std::cout << "\r  Downloading frame " << i << "/" << frames_to_read << "    " << std::flush;
-                }
+        int valid_frames = 0;
+
+        for (int i = 1; i <= (int)timestamps.size() && !g_abort_download.load(std::memory_order_acquire); i++) {
+            
+            // Richiede all'oscilloscopio di puntare al frame i-esimo
+            send_cmd(sock, "HISTOR:FRAM " + std::to_string(i));
+            
+            // Interroga l'oscilloscopio per confermare su quale frame si trova realmente
+            send_cmd(sock, "HISTOR:FRAM?");
+            std::string check_resp = read_resp_string(sock);
+            int actual_frame = 0;
+            try { actual_frame = std::stoi(extract_value(check_resp)); } catch (...) {}
+
+            // Se l'hardware ha forzato un frame inferiore a quello richiesto,
+            // significa che abbiamo raggiunto e superato il limite di memoria.
+            if (actual_frame < i) {
+                break;
             }
-            std::cout << "\n"; // Aggiunge nuova riga solo se il download è effettivamente avvenuto
-            outfile.flush();
+
+            // Procedi con la misurazione sul frame confermato
+            send_cmd(sock, "C1:PAVA? " + meas_type);
+            
+            std::string val_str = extract_value(read_resp_string(sock));
+            if (val_str != "?") {
+                try {
+                    double val = std::abs(std::stod(val_str));
+                    
+                    if (!has_t0) {
+                        global_t0 = timestamps[0];
+                        has_t0 = true;
+                    }
+
+                    double t_rel_s = (timestamps[i-1] - global_t0) / 1e9;
+                    outfile << std::fixed << std::setprecision(6) << t_rel_s << " " << val << "\n";
+                    total_saved_events++;
+                    valid_frames++;
+                } catch (...) {}
+            }
+            
+            // Aggiornamento progressivo della UI (ogni 10 frame per ridurre I/O a terminale)
+            if (valid_frames % 10 == 0 || valid_frames == 1) {
+                std::cout << "\r  Downloading frame " << valid_frames << "    " << std::flush;
+            }
         }
         
-        // Reset modes for the next acquisition loop
+        if (valid_frames > 0) {
+            std::cout << "\r  Completed download of " << valid_frames << " frames.        \n";
+            outfile.flush();
+        } else {
+            std::cout << "  No valid frames found for download.\n";
+        }
+        
+        // Disable History mode
         send_cmd(sock, "HISTORy OFF");
-        send_cmd(sock, "ACQ:SEQ OFF");
+        send_cmd(sock, "SEQ OFF");
     }
 
     std::cout << ANSI_CYAN << "\n[System]" << ANSI_RESET << " Shutting down. Total events saved: " << total_saved_events << "\n";
